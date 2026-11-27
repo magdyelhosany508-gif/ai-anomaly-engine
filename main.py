@@ -3,7 +3,7 @@ import time
 import joblib
 import numpy as np
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 # تهيئة تطبيق FastAPI الخاص بمحرك الذكاء الاصطناعي
 app = FastAPI(
@@ -11,48 +11,76 @@ app = FastAPI(
     description=(
         "Real-time behavioral anomaly detection microservice using Random Forest"
     ),
-    version="1.0.0",
+    version="1.2.1",
 )
 
-# تحميل الموديل المدرب مرة واحدة عند تشغيل السيرفر
+# تحميل الموديل المدرب (Pipeline: StandardScaler + RandomForest) مرة واحدة عند التشغيل
 MODEL_PATH = os.path.join(
     os.path.dirname(__file__), "zero_trust_rf_model.joblib"
 )
 ai_pipeline = joblib.load(MODEL_PATH)
 
-# ضبط عدد الأنوية على 1 لتجنب تأخير فتح الـ Threads عند فحص عينة واحدة في الوقت الفعلي
-ai_pipeline.named_steps["rf"].n_jobs = 1
+# استخراج معاملات الـ StandardScaler لتطبيقها مباشرة بـ NumPy (أسرع وبدون تحذيرات متكررة)
+scaler = ai_pipeline[0]
+scaler_mean = scaler.mean_.astype(np.float32)
+scaler_scale = scaler.scale_.astype(np.float32)
+
+rf_model = ai_pipeline.named_steps["rf"]
+rf_model.n_jobs = 1
 
 # تسخين الموديل في الذاكرة (Warm-up) لضمان أقصى سرعة لأول طلب فعلي
 _dummy_input = np.zeros((1, 8), dtype=np.float32)
-ai_pipeline.predict(_dummy_input)
+rf_model.predict_proba(_dummy_input)
 
 
-# تعريف شكل البيانات (JSON) التي سيرسلها الـ Gateway أو الـ .NET Backend
+# تعريف شكل البيانات (JSON) التي سيرسلها الـ Gateway (نافذة زمنية = 1.0 ثانية)
 class TrafficWindow(BaseModel):
+  model_config = ConfigDict(populate_by_name=True)
+
   device_id: str
   network_packets_all_count: float
   network_packets_src_count: float
   network_packets_dst_count: float
-  network_packet_size_avg: float
-  network_payload_length_avg: float
-  network_time_delta_avg: float
-  network_interval_packets: float
+  network_packet_size_avg: float = Field(alias="network_packet-size_avg")
+  network_payload_length_avg: float = Field(alias="network_payload-length_avg")
+  network_time_delta_avg: float = Field(alias="network_time-delta_avg")
+  network_interval_packets: float = Field(alias="network_interval-packets")
   network_ips_dst_count: float
+
+
+def map_progressive_policy(risk_score: float) -> str:
+  """
+    تحويل نسبة الخطورة اللحظية إلى أحد مستويات القرار الأربعة المعتمدة في الـ ERD والـ Class Diagram:
+    ALLOW -> MONITOR -> DENY -> QUARANTINE
+    تتطابق عتبة 50% مع الحد الفاصل الافتراضي لتصنيف Random Forest (0 = Benign, 1 = Attack).
+    """
+  if risk_score < 20.0:
+    return "ALLOW"
+  elif risk_score < 50.0:
+    return "MONITOR"
+  elif risk_score < 75.0:
+    return "DENY"
+  else:
+    return "QUARANTINE"
 
 
 # نقطة فحص للتأكد من أن السيرفر يعمل
 @app.get("/")
 def health_check():
-  return {"status": "online", "model": "RandomForest-Edge-v1"}
+  return {
+      "status": "online",
+      "model": "RandomForest-Edge-v1.2.1",
+      "window_size_sec": 1.0,
+      "policy_tiers": ["ALLOW", "MONITOR", "DENY", "QUARANTINE"],
+  }
 
 
-# نقطة التنبؤ واتخاذ قرار السماح أو العزل الفوري
+# نقطة التنبؤ واستخراج نسبة الخطورة والقرار المتدرج
 @app.post("/predict")
 def predict_traffic(data: TrafficWindow):
   start_time = time.perf_counter()
 
-  # تحويل المدخلات مباشرة إلى مصفوفة NumPy سريعة بدون حمل إضافي على الذاكرة
+  # ترتيب الـ 8 خصائص بنفس الترتيب الدقيق المستخدم أثناء التدريب
   features = np.array(
       [[
           data.network_packets_all_count,
@@ -67,25 +95,31 @@ def predict_traffic(data: TrafficWindow):
       dtype=np.float32,
   )
 
-  # استخراج القرار (0 = طبيعي، 1 = هجوم) واحتمالية الخطورة
-  prediction = int(ai_pipeline.predict(features)[0])
-  attack_probability = float(ai_pipeline.predict_proba(features)[0][1])
+  # تطبيق الـ StandardScaler وحساب احتمالية الهجوم مرة واحدة فقط
+  features_scaled = (features - scaler_mean) / scaler_scale
+  attack_probability = float(rf_model.predict_proba(features_scaled)[0][1])
 
-  # حساب زمن اتخاذ القرار بالمايكروثانية
-  latency_us = (time.perf_counter() - start_time) * 1_000_000
-  action = "ISOLATE" if prediction == 1 else "ALLOW"
+  prediction = 1 if attack_probability >= 0.5 else 0
+  risk_score = round(attack_probability * 100, 2)
+  action = map_progressive_policy(risk_score)
+
+  # حساب زمن اتخاذ القرار بالمللي ثانية (ms)
+  latency_ms = (time.perf_counter() - start_time) * 1_000
 
   return {
       "device_id": data.device_id,
       "prediction": prediction,
       "action": action,
-      "risk_score": round(attack_probability * 100, 2),
-      "inference_latency_us": round(latency_us, 2),
+      "risk_score": risk_score,
+      "inference_latency_ms": round(latency_ms, 3),
   }
 
 
-# تشغيل السيرفر مباشرة عند تنفيذ الملف
 if __name__ == "__main__":
   import uvicorn
 
-  uvicorn.run(app, host="127.0.0.1", port=8000)
+  print("\n==========================================")
+  print("Local Test URL:   http://127.0.0.1:8000")
+  print("Interactive Docs: http://127.0.0.1:8000/docs")
+  print("==========================================\n")
+  uvicorn.run(app, host="0.0.0.0", port=8000)
